@@ -241,17 +241,24 @@ def login_to_commonsku(page):
 
             # Click submit
             submit_selectors = [
-                'button[type="submit"]',
-                'input[type="submit"]',
+                'button:has-text("Login")',
                 'button:has-text("Log In")',
                 'button:has-text("Sign In")',
+                'button[type="submit"]',
+                'input[type="submit"]',
             ]
+            submit_clicked = False
             for selector in submit_selectors:
                 element = page.query_selector(selector)
-                if element:
+                if element and element.is_visible():
                     element.click()
-                    logger.info("Clicked submit button")
+                    submit_clicked = True
+                    logger.info("Clicked submit button with selector: %s", selector)
                     break
+
+            if not submit_clicked:
+                logger.error("Could not find any submit button on login page")
+                raise Exception("No submit button found on login page")
 
             page.wait_for_timeout(5000)
 
