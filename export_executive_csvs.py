@@ -133,7 +133,7 @@ def upsert_csv_to_supabase(table_name: str, csv_content: str, export_date: str):
             if csv_col is None:
                 continue
             # Convert "Sales Rep First Name" -> "sales_rep_first_name"
-            db_col = csv_col.strip().lower().replace(" ", "_").replace("(", "").replace(")", "").replace("%", "").strip("_")
+            db_col = csv_col.strip().lower().replace(" ", "_").replace("-", "_").replace("(", "").replace(")", "").replace("%", "").strip("_")
             # Clean value
             clean_value = value.strip().strip('"').strip("'") if value else None
 
