@@ -1,0 +1,88 @@
+name: Executive Sales Report - CSV Export
+
+on:
+  # Scheduled run - Wednesdays at 5:00 PM EST (22:00 UTC)
+  # Runs 1 hour before the Zapier "Geoff: Sales Reports" trigger at 6 PM EST
+  schedule:
+    - cron: '0 22 * * 3'  # Wednesday at 5 PM EST (10 PM UTC)
+
+  # Allow manual trigger for testing or re-runs
+  workflow_dispatch:
+    inputs:
+      report_scope:
+        description: 'Which reports to download'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - weekly
+          - monthly
+          - ytd
+
+jobs:
+  export-executive-csvs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright supabase python-dotenv
+          playwright install chromium --with-deps
+
+      - name: Create .env file
+        env:
+          COMMONSKU_EMAIL: ${{ secrets.COMMONSKU_EMAIL }}
+          COMMONSKU_PASSWORD: ${{ secrets.COMMONSKU_PASSWORD }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          cat > .env << ENVFILE
+          COMMONSKU_URL=https://idegy.commonsku.com
+          COMMONSKU_EMAIL=${COMMONSKU_EMAIL}
+          COMMONSKU_PASSWORD=${COMMONSKU_PASSWORD}
+          SUPABASE_URL=${SUPABASE_URL}
+          SUPABASE_KEY=${SUPABASE_KEY}
+          HEADLESS=true
+          DOWNLOAD_DIR=./downloads
+          MAX_RETRIES=3
+          RETRY_DELAY=5000
+          DEBUG=true
+          ENVFILE
+          echo "--- .env file created ---"
+          cat .env | grep -v PASSWORD | grep -v KEY
+
+      - name: Create downloads directory
+        run: mkdir -p downloads
+
+      - name: Run executive report CSV export
+        run: |
+          SCOPE="${{ github.event.inputs.report_scope || 'all' }}"
+          python export_executive_csvs.py --scope "$SCOPE"
+        env:
+          NODE_ENV: production
+
+      - name: Upload logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: executive-report-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
+
+      - name: Upload downloaded CSVs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: executive-report-csvs-${{ github.run_id }}
+          path: downloads/
+          retention-days: 7
