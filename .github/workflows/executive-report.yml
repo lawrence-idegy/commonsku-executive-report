@@ -1,10 +1,10 @@
 name: Executive Sales Report - CSV Export
 
 on:
-  # Scheduled run - Fridays at 5:15 PM EST (22:15 UTC)
-  # Runs 45 min before the Zapier "Geoff: Sales Reports" trigger at 6 PM EST
+  # Scheduled run - Fridays at 5:05 PM ET (21:05 UTC during EDT, 22:05 UTC during EST)
+  # Runs ~55 min before the Zapier "Geoff: Sales Reports" trigger at 6 PM ET
   schedule:
-    - cron: '15 22 * * 5'  # Friday at 5:15 PM EST (10:15 PM UTC)
+    - cron: '5 21 * * 5'  # Friday at 5:05 PM EDT (9:05 PM UTC)
 
   # Allow manual trigger for testing or re-runs
   workflow_dispatch:
