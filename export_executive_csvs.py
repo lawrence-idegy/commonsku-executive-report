@@ -1,21 +1,30 @@
 """
 export_executive_csvs.py
 ========================
-Downloads Sales Dashboard CSVs from CommonSKU and upserts to Supabase.
+Downloads BOTH Sales Rep and Sales Dashboard CSVs from CommonSKU
+and upserts to Supabase.
 
 Workflow 2: Executive Sales Report (David Brown)
 -------------------------------------------------
-Downloads three date-range variants of the Sales Dashboard report:
-  - "This Week"  -> commonsku_sr_weekly
-  - "This Month" -> commonsku_sr_monthly
-  - "This Year"  -> commonsku_sr_ytd
+For each date range (This Week / This Month / This Year), downloads
+two reports:
 
-The Sales Dashboard report (/report/sales-dashboard) includes both
-Sales Order and In Production rows, allowing the downstream Zapier
-step to filter for In Production totals. Each CSV row is augmented
-with export_date (today, YYYY-MM-DD) and inserted into the
-corresponding Supabase table using a delete-then-insert strategy
-keyed on export_date.
+  1. Sales Rep report (/report/sales-rep, Form Type = Sales Order)
+     -> commonsku_sr_weekly / commonsku_sr_monthly / commonsku_sr_ytd
+     Contains individual order rows with subtotal and booked_margin
+     for GP% calculations.
+
+  2. Sales Dashboard report (/report/sales-dashboard)
+     -> commonsku_exec_dash_weekly / commonsku_exec_dash_monthly / commonsku_exec_dash_ytd
+     Contains per-rep summary rows with total_in_production,
+     total_sales_orders, and total_invoices aggregates.
+
+The downstream Zapier step merges both datasets:
+  - Sales Rep data for GP% (booked_margin on individual orders)
+  - Dashboard data for In Production dollar totals per rep
+
+Each CSV row is augmented with export_date (today, YYYY-MM-DD)
+and inserted using a delete-then-insert strategy keyed on export_date.
 
 Usage:
   python export_executive_csvs.py --scope all
@@ -55,9 +64,21 @@ RETRY_DELAY = int(os.getenv("RETRY_DELAY", "5000"))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
 REPORT_JOBS = {
-    "weekly":  {"date_filter": "This Week",  "table": "commonsku_sr_weekly"},
-    "monthly": {"date_filter": "This Month", "table": "commonsku_sr_monthly"},
-    "ytd":     {"date_filter": "This Year",  "table": "commonsku_sr_ytd"},
+    "weekly": {
+        "date_filter": "This Week",
+        "sr_table": "commonsku_sr_weekly",
+        "dash_table": "commonsku_exec_dash_weekly",
+    },
+    "monthly": {
+        "date_filter": "This Month",
+        "sr_table": "commonsku_sr_monthly",
+        "dash_table": "commonsku_exec_dash_monthly",
+    },
+    "ytd": {
+        "date_filter": "This Year",
+        "sr_table": "commonsku_sr_ytd",
+        "dash_table": "commonsku_exec_dash_ytd",
+    },
 }
 
 TODAY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -182,7 +203,7 @@ def upsert_csv_to_supabase(table_name: str, csv_content: str, export_date: str):
 
 
 # ---------------------------------------------------------------------------
-# Playwright: CommonSKU login + Dashboard CSV download
+# Playwright: CommonSKU login + CSV downloads
 # ---------------------------------------------------------------------------
 def login_to_commonsku(page):
     """Log into CommonSKU with retry logic."""
@@ -281,6 +302,156 @@ def login_to_commonsku(page):
                 time.sleep(RETRY_DELAY / 1000)
 
     raise Exception(f"Failed to log into CommonSKU after {MAX_RETRIES} attempts")
+
+
+def download_sr_report(page, date_filter: str, download_dir: str) -> str:
+    """
+    Navigate to CommonSKU Sales Rep report, set Form Type = Sales Order,
+    apply date filter, and download the CSV.
+    Returns the CSV file content as a string.
+
+    The Sales Rep report gives individual order rows with subtotal and
+    booked_margin for GP% calculations.
+    """
+    logger.info("Downloading Sales Rep report with date filter: %s", date_filter)
+
+    # Navigate to Sales Rep report
+    page.goto(f"{COMMONSKU_URL}/report/sales-rep", wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(5000)
+
+    # Select Form Type = Sales Order
+    logger.info("Setting Form Type to: Sales Order")
+    try:
+        form_type_selector = page.query_selector('select[name="form_type"], select#form_type')
+        if form_type_selector:
+            form_type_selector.select_option(label="Sales Order")
+            logger.info("Selected Form Type: Sales Order via <select>")
+            page.wait_for_timeout(1000)
+        else:
+            # Try clicking a dropdown-style Form Type control
+            form_type_labels = page.query_selector_all('text="Form Type"')
+            for label in form_type_labels:
+                parent = label.query_selector('xpath=..')
+                if parent:
+                    select_el = parent.query_selector('select')
+                    if select_el:
+                        select_el.select_option(label="Sales Order")
+                        logger.info("Selected Form Type: Sales Order via parent select")
+                        page.wait_for_timeout(1000)
+                        break
+    except Exception as exc:
+        logger.warning("Could not set Form Type: %s", exc)
+
+    # Set date range
+    logger.info("Setting date range to: %s", date_filter)
+    try:
+        date_input = page.query_selector('input[readonly][type="text"]')
+        if date_input:
+            date_input.click()
+            page.wait_for_timeout(2000)
+
+            date_options = page.query_selector_all(f'text="{date_filter}"')
+            for option in date_options:
+                if option.is_visible():
+                    option.click()
+                    logger.info("Selected date range: %s", date_filter)
+                    page.wait_for_timeout(1000)
+                    break
+        else:
+            logger.warning("Date input not found")
+    except Exception as exc:
+        logger.warning("Could not set date range to %s: %s", date_filter, exc)
+
+    # Click Get Report
+    logger.info("Clicking Get Report button...")
+    report_button_selectors = [
+        "#get-report-btn",
+        'button:has-text("Get Report")',
+        'button:has-text("Generate Report")',
+        'button:has-text("Run Report")',
+    ]
+    for selector in report_button_selectors:
+        element = page.query_selector(selector)
+        if element:
+            element.click()
+            logger.info("Clicked Get Report")
+            break
+
+    # Wait for report to generate
+    logger.info("Waiting for report generation...")
+    page.wait_for_timeout(10000)
+
+    # Set up download listener, then click Export
+    with page.expect_download(timeout=45000) as download_info:
+        # Open Actions dropdown
+        actions_selectors = [
+            'button:has-text("Actions")',
+            'button.btn-default:has-text("Actions")',
+            'button[aria-haspopup="true"]:has-text("Actions")',
+            'button:has-text("Export")',
+        ]
+        actions_opened = False
+        for selector in actions_selectors:
+            try:
+                element = page.query_selector(selector)
+                if element and element.is_visible():
+                    element.click()
+                    actions_opened = True
+                    logger.info("Opened Actions dropdown")
+                    page.wait_for_timeout(1500)
+                    break
+            except Exception:
+                continue
+
+        if not actions_opened:
+            for btn in page.query_selector_all("button"):
+                text = btn.text_content() or ""
+                if "action" in text.lower():
+                    btn.click()
+                    actions_opened = True
+                    logger.info("Opened Actions via text search")
+                    page.wait_for_timeout(1500)
+                    break
+
+        # Click Export Report
+        export_selectors = [
+            'text="Export Report"',
+            'a:has-text("Export Report")',
+            'button:has-text("Export Report")',
+            '[role="menuitem"]:has-text("Export")',
+            'text="Export"',
+        ]
+        export_clicked = False
+        for selector in export_selectors:
+            try:
+                elements = page.query_selector_all(selector)
+                for element in elements:
+                    if element.is_visible():
+                        element.click()
+                        export_clicked = True
+                        logger.info("Clicked Export Report")
+                        break
+                if export_clicked:
+                    break
+            except Exception:
+                continue
+
+        if not export_clicked:
+            screenshot_path = os.path.join(download_dir, f"error_sr_{date_filter}_{int(time.time())}.png")
+            page.screenshot(path=screenshot_path, full_page=True)
+            raise Exception(f"Could not click Export Report for SR {date_filter}")
+
+    download = download_info.value
+    csv_filename = f"sr-{date_filter.lower().replace(' ', '-')}-{TODAY}.csv"
+    csv_path = os.path.join(download_dir, csv_filename)
+    download.save_as(csv_path)
+    logger.info("Downloaded CSV: %s", csv_path)
+
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        content = f.read()
+
+    logger.info("CSV has %d lines", content.count("\n"))
+    return content
 
 
 def download_dashboard_report(page, date_filter: str, download_dir: str) -> str:
@@ -458,33 +629,59 @@ def main():
         # Login
         login_to_commonsku(page)
 
-        # Download and upsert each report
+        # Download and upsert each report (both SR and Dashboard per date range)
         for job_name, job_config in jobs_to_run:
             date_filter = job_config["date_filter"]
-            table_name = job_config["table"]
+            sr_table = job_config["sr_table"]
+            dash_table = job_config["dash_table"]
 
+            # --- Sales Rep report (individual orders with GP%) ---
+            sr_key = f"{job_name}_sr"
             logger.info("-" * 40)
-            logger.info("JOB: %s (filter=%s, table=%s)", job_name, date_filter, table_name)
+            logger.info("JOB: %s SR (filter=%s, table=%s)", job_name, date_filter, sr_table)
 
             try:
-                csv_content = download_dashboard_report(page, date_filter, DOWNLOAD_DIR)
+                sr_csv = download_sr_report(page, date_filter, DOWNLOAD_DIR)
 
-                if not csv_content or not csv_content.strip():
-                    logger.warning("Empty CSV for %s, skipping Supabase upload", job_name)
-                    results[job_name] = {"status": "empty", "rows": 0}
-                    continue
-
-                row_count = upsert_csv_to_supabase(table_name, csv_content, TODAY)
-                results[job_name] = {"status": "success", "rows": row_count}
-                logger.info("SUCCESS: %s -> %d rows upserted to %s", job_name, row_count, table_name)
+                if not sr_csv or not sr_csv.strip():
+                    logger.warning("Empty SR CSV for %s, skipping", job_name)
+                    results[sr_key] = {"status": "empty", "rows": 0}
+                else:
+                    sr_rows = upsert_csv_to_supabase(sr_table, sr_csv, TODAY)
+                    results[sr_key] = {"status": "success", "rows": sr_rows}
+                    logger.info("SUCCESS: %s SR -> %d rows to %s", job_name, sr_rows, sr_table)
 
             except Exception as exc:
-                logger.error("FAILED: %s -> %s", job_name, exc)
-                results[job_name] = {"status": "error", "error": str(exc)}
-
-                # Take screenshot on failure
+                logger.error("FAILED: %s SR -> %s", job_name, exc)
+                results[sr_key] = {"status": "error", "error": str(exc)}
                 try:
-                    screenshot_path = os.path.join(DOWNLOAD_DIR, f"error_{job_name}_{int(time.time())}.png")
+                    screenshot_path = os.path.join(DOWNLOAD_DIR, f"error_{job_name}_sr_{int(time.time())}.png")
+                    page.screenshot(path=screenshot_path, full_page=True)
+                    logger.info("Error screenshot: %s", screenshot_path)
+                except Exception:
+                    pass
+
+            # --- Dashboard report (per-rep In Production totals) ---
+            dash_key = f"{job_name}_dash"
+            logger.info("-" * 40)
+            logger.info("JOB: %s DASH (filter=%s, table=%s)", job_name, date_filter, dash_table)
+
+            try:
+                dash_csv = download_dashboard_report(page, date_filter, DOWNLOAD_DIR)
+
+                if not dash_csv or not dash_csv.strip():
+                    logger.warning("Empty Dashboard CSV for %s, skipping", job_name)
+                    results[dash_key] = {"status": "empty", "rows": 0}
+                else:
+                    dash_rows = upsert_csv_to_supabase(dash_table, dash_csv, TODAY)
+                    results[dash_key] = {"status": "success", "rows": dash_rows}
+                    logger.info("SUCCESS: %s DASH -> %d rows to %s", job_name, dash_rows, dash_table)
+
+            except Exception as exc:
+                logger.error("FAILED: %s DASH -> %s", job_name, exc)
+                results[dash_key] = {"status": "error", "error": str(exc)}
+                try:
+                    screenshot_path = os.path.join(DOWNLOAD_DIR, f"error_{job_name}_dash_{int(time.time())}.png")
                     page.screenshot(path=screenshot_path, full_page=True)
                     logger.info("Error screenshot: %s", screenshot_path)
                 except Exception:
