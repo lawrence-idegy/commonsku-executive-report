@@ -1,19 +1,21 @@
 """
 export_executive_csvs.py
 ========================
-Downloads Sales Rep CSVs from CommonSKU and upserts to Supabase.
+Downloads Sales Dashboard CSVs from CommonSKU and upserts to Supabase.
 
 Workflow 2: Executive Sales Report (David Brown)
 -------------------------------------------------
-Downloads three date-range variants of the Sales Rep report:
+Downloads three date-range variants of the Sales Dashboard report:
   - "This Week"  -> commonsku_sr_weekly
   - "This Month" -> commonsku_sr_monthly
   - "This Year"  -> commonsku_sr_ytd
 
-Each CSV row is augmented with export_date (today, YYYY-MM-DD) and
-upserted into the corresponding Supabase table. Upsert uses
-(export_date, order_number) as the conflict key so re-runs overwrite
-the same day's data without creating duplicates.
+The Sales Dashboard report (/report/sales-dashboard) includes both
+Sales Order and In Production rows, allowing the downstream Zapier
+step to filter for In Production totals. Each CSV row is augmented
+with export_date (today, YYYY-MM-DD) and inserted into the
+corresponding Supabase table using a delete-then-insert strategy
+keyed on export_date.
 
 Usage:
   python export_executive_csvs.py --scope all
@@ -138,9 +140,13 @@ def upsert_csv_to_supabase(table_name: str, csv_content: str, export_date: str):
             clean_value = value.strip().strip('"').strip("'") if value else None
 
             # Try to cast numeric-looking values
+            # Covers both Sales Rep and Sales Dashboard CSV columns
             if clean_value and db_col in (
                 "subtotal", "taxes", "total", "booked_margin",
-                "booked_margin_amount", "project_budget"
+                "booked_margin_amount", "project_budget",
+                "sales_order_total", "in_production_total",
+                "invoice_total", "total_in_production_margin",
+                "margin", "margin_amount", "amount",
             ):
                 try:
                     clean_value = float(clean_value.replace("$", "").replace(",", ""))
@@ -176,7 +182,7 @@ def upsert_csv_to_supabase(table_name: str, csv_content: str, export_date: str):
 
 
 # ---------------------------------------------------------------------------
-# Playwright: CommonSKU login + CSV download
+# Playwright: CommonSKU login + Dashboard CSV download
 # ---------------------------------------------------------------------------
 def login_to_commonsku(page):
     """Log into CommonSKU with retry logic."""
@@ -191,7 +197,7 @@ def login_to_commonsku(page):
 
             # Check if already logged in
             if "/login" not in current_url and "/signin" not in current_url:
-                page.goto(f"{COMMONSKU_URL}/report/sales-rep", wait_until="domcontentloaded", timeout=15000)
+                page.goto(f"{COMMONSKU_URL}/report/sales-dashboard", wait_until="domcontentloaded", timeout=15000)
                 page.wait_for_timeout(2000)
                 if "/report" in page.url:
                     logger.info("Already logged in")
@@ -277,40 +283,19 @@ def login_to_commonsku(page):
     raise Exception(f"Failed to log into CommonSKU after {MAX_RETRIES} attempts")
 
 
-def download_sr_report(page, date_filter: str, download_dir: str) -> str:
+def download_dashboard_report(page, date_filter: str, download_dir: str) -> str:
     """
-    Navigate to CommonSKU Sales Rep report, apply date filter,
+    Navigate to CommonSKU Sales Dashboard report, apply date filter,
     and download the CSV. Returns the CSV file content as a string.
+
+    The Sales Dashboard includes both Sales Order and In Production
+    rows â no Form Type filter needed (unlike the Sales Rep report).
     """
-    logger.info("Downloading SR report with date filter: %s", date_filter)
+    logger.info("Downloading Dashboard report with date filter: %s", date_filter)
 
-    # Navigate to Sales Rep report
-    page.goto(f"{COMMONSKU_URL}/report/sales-rep", wait_until="domcontentloaded", timeout=30000)
+    # Navigate to Sales Dashboard report
+    page.goto(f"{COMMONSKU_URL}/report/sales-dashboard", wait_until="domcontentloaded", timeout=30000)
     page.wait_for_timeout(5000)
-
-    # Select Form Type: Sales Order
-    try:
-        form_type_container = page.query_selector('[data-testid="sales_rep-filter-form_type"]')
-        if form_type_container:
-            dropdown = form_type_container.query_selector(".commonsku-styles-select__control")
-            if dropdown:
-                dropdown.click()
-                page.wait_for_timeout(1500)
-                sales_order_option = page.query_selector(
-                    'div.commonsku-styles-select__option:has-text("Sales Order")'
-                )
-                if sales_order_option and sales_order_option.is_visible():
-                    sales_order_option.click()
-                    logger.info("Selected Form Type: Sales Order")
-                    page.wait_for_timeout(1000)
-                else:
-                    logger.warning("Sales Order option not found/visible in dropdown")
-            else:
-                logger.warning("Dropdown control not found in Form Type container")
-        else:
-            logger.warning("Form Type container not found")
-    except Exception as exc:
-        logger.error("Failed to select Form Type: %s", exc)
 
     # Set date range
     logger.info("Setting date range to: %s", date_filter)
@@ -408,12 +393,12 @@ def download_sr_report(page, date_filter: str, download_dir: str) -> str:
                 continue
 
         if not export_clicked:
-            screenshot_path = os.path.join(download_dir, f"error_sr_{date_filter}_{int(time.time())}.png")
+            screenshot_path = os.path.join(download_dir, f"error_dashboard_{date_filter}_{int(time.time())}.png")
             page.screenshot(path=screenshot_path, full_page=True)
             raise Exception(f"Could not click Export Report for {date_filter}")
 
     download = download_info.value
-    csv_filename = f"sr-{date_filter.lower().replace(' ', '-')}-{TODAY}.csv"
+    csv_filename = f"dashboard-{date_filter.lower().replace(' ', '-')}-{TODAY}.csv"
     csv_path = os.path.join(download_dir, csv_filename)
     download.save_as(csv_path)
     logger.info("Downloaded CSV: %s", csv_path)
@@ -482,7 +467,7 @@ def main():
             logger.info("JOB: %s (filter=%s, table=%s)", job_name, date_filter, table_name)
 
             try:
-                csv_content = download_sr_report(page, date_filter, DOWNLOAD_DIR)
+                csv_content = download_dashboard_report(page, date_filter, DOWNLOAD_DIR)
 
                 if not csv_content or not csv_content.strip():
                     logger.warning("Empty CSV for %s, skipping Supabase upload", job_name)
@@ -521,4 +506,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
